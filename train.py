@@ -39,6 +39,10 @@ import argparse
 #   就是你在命令行输入的 --max_iters 2000 这种东西，argparse 帮你自动解析成变量。
 #   有了它，不用改代码就能调整训练参数。
 
+import math
+# ↑ math 是 Python 标准库，提供数学函数。
+#   我们用 math.cos（余弦）来实现"余弦退火"学习率调度（后面会看到）。
+
 import torch
 # ↑ 导入 PyTorch（深度学习库），和 model.py 里一样。
 
@@ -79,6 +83,10 @@ def main():
     ap.add_argument("--n_head", type=int, default=4, help="注意力头数")
     ap.add_argument("--n_embd", type=int, default=128, help="向量维度")
     ap.add_argument("--lr", type=float, default=3e-4, help="学习率（每次更新权重的步长）")
+    ap.add_argument("--warmup_iters", type=int, default=100,
+                    help="学习率热身步数（前这么多步从 0 线性升到 lr，之后余弦退火）")
+    ap.add_argument("--lr_min", type=float, default=None,
+                    help="学习率退火最低值（默认 = 峰值 lr 的 1/10，不降到 0）")
     ap.add_argument("--print_weights", action="store_true", help="训练结束后打印每层权重信息")
     ap.add_argument("--save", default="model.pt", help="保存的模型文件名")
     ap.add_argument("--log", default="", help="训练日志 CSV 路径（记录每步 loss，留空则不记录）")
@@ -163,6 +171,28 @@ def main():
     #   lr=learning rate 学习率：每次更新权重的"步长"。
     #      太大会震荡（loss 下不去），太小会学得慢。3e-4 是 GPT 的标准值。
 
+    # ---- 学习率调度器（第 1 级升级：让学习率"会自己变"）----
+    # 固定学习率的问题是：前期大步子好（快点赶到谷底附近），
+    # 但到了谷底附近还迈大步就会"来回震荡"，降不下去。
+    # 所以业界做法是：前 warmup_iters 步从 0 线性升到 lr（热身，防起步震荡），
+    # 之后按"余弦曲线"从 lr 慢慢降到 lr_min（默认 lr 的 1/10），精细收敛。
+    # 注意：退火不是降到 0！降到 0 会让后期完全停止学习（实验 4a 验证过）。
+    lr_min = args.lr_min if args.lr_min is not None else args.lr / 10
+    # ↑ 退火的最低学习率。默认是峰值的 1/10（比如 3e-4 → 3e-5）。
+
+    def lr_lambda(step):
+        # ↑ 这个函数告诉调度器："第 step 步时，学习率应该是峰值的多少倍"
+        if step < args.warmup_iters:
+            # 热身阶段：从 0 线性升到 1（峰值的 1 倍 = 就是 lr）
+            return (step + 1) / args.warmup_iters
+        # 退火阶段：progress 从 0 走到 1，余弦从 1 平滑降到 lr_min/lr（默认 0.1）
+        progress = (step - args.warmup_iters) / max(1, args.max_iters - args.warmup_iters)
+        return lr_min / args.lr + (1 - lr_min / args.lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # ↑ PyTorch 的"学习率调度器"：每次 optimizer.step() 更新权重后，
+    #   调用 scheduler.step() 就会按 lr_lambda 自动调整下一步的学习率。
+
     # ==========================================================================
     # 【第 4 步：定义"取一批数据"的函数】
     # ==========================================================================
@@ -231,6 +261,11 @@ def main():
         #   新权重 = 旧权重 - 学习率 × 梯度
         #   这一步之后，模型就"稍微聪明了一点点"。
 
+        # ---- 5.5b 更新学习率（第 1 级升级）----
+        scheduler.step()
+        # ↑ 让学习率按 lr_lambda 的曲线走：热身期上升，之后余弦退火下降。
+        #   当前学习率 = lr × lr_lambda(step)，可以从 optimizer 里读出来看。
+
         # ---- 5.6 定期打印进度 ----
         if step % args.eval_interval == 0 or step == args.max_iters - 1:
             # 用验证集算一下 loss（检查有没有过拟合）
@@ -240,9 +275,10 @@ def main():
                 # ↑ * 是解包，把 get_batch 返回的 (x, y) 拆开传进去
 
             dt = time.time() - t0  # 累计用时
+            cur_lr = optimizer.param_groups[0]["lr"]  # 当前学习率（调度器调出来的）
             print(
                 f"step {step:6d} | train loss {loss.item():.4f} | "
-                f"val loss {val_loss.item():.4f} | 累计用时 {dt:6.1f}s"
+                f"val loss {val_loss.item():.4f} | lr {cur_lr:.2e} | 累计用时 {dt:6.1f}s"
             )
             # loss.item() 把单元素张量转成 Python 数字
             # :6d 表示占 6 位右对齐，:.4f 表示保留 4 位小数

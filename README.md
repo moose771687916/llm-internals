@@ -147,11 +147,12 @@ llm-internals/
 
 ## 实验记录
 
-> 持续更新中 —— 三个实验的进行状态：
+> 持续更新中 —— 四个实验的进行状态：
 
 - [x] **loss 曲线可视化**：`python train.py --log loss_log.csv --eval_interval 50` 记录日志 → `python plot_loss.py` 画图（见上方训练效果图）
 - [x] **GELU vs SwiGLU 消融实验**：两版各训 2000 步，参数量基本持平（821,248 vs 824,320，差 0.4%），对比结论见下
 - [x] **训练前后生成效果对比**：随机模型 vs 训练后模型（见下，完整文本在 `assets/before_train.txt` / `assets/after_train.txt`）
+- [x] **学习率调度实验**：固定学习率 vs warmup+余弦退火，三版各训 2000 步，验证"调度威力在长训练"（见下）
 
 ### 实验 2：GELU vs SwiGLU 消融
 
@@ -200,6 +201,31 @@ My little have the shing hearting her hate;
 **结论**：训练前权重是随机数，模型"什么都不知道"，输出纯乱码；训练 2000 步后，82 万权重里存下了"什么字符经常挨着"的统计规律——有角色名、有对白分行、句子半通不通。**这就是大模型语言能力的诞生过程**。
 
 复现方法：`python before_after_demo.py`（完整文本存于 `assets/before_train.txt` / `assets/after_train.txt`）
+
+### 实验 4：学习率调度（warmup + 余弦退火）对比
+
+![固定学习率 vs 退火到lr/10 对比](assets/loss_sched2_compare.png)
+
+同一个模型、同一份数据、同样的 2000 步，三种学习率策略：
+
+| 策略 | 最终 train loss | 最终 val loss |
+|---|---:|---:|
+| 固定学习率（3e-4 全程） | 1.478 | **1.642** |
+| warmup + 退火到 0（第一版） | 1.615 | 1.726 |
+| warmup + 退火到 lr/10（改进版） | 1.586 | 1.701 |
+
+**结论**（这个结论不是书上抄的，是三组真实训练数据跑出来的）：
+- **退火不该退到 0**：退到 0 意味着后期学习率趋近于 0，模型完全停止学习，白白浪费步数（第一版 val 1.726 最差）；退到峰值的 1/10 明显更好（1.701）。
+- **2000 步的小短跑里，固定学习率仍然略胜**：全程满速 3e-4 大踏步，在短训练里占便宜。
+- **但改进版曲线末期没有饱和**（val 从 1.733 一路缓降到 1.701），固定版后期已经趋平震荡——**只要训练够长，学习率调度会翻盘**。这正是 GPT/Llama/DeepSeek 等大模型（动辄几万步）全部使用学习率调度的原因：**调度的威力在长训练才释放**。
+
+复现方法：
+```bash
+python train.py --log loss_log.csv --save model.pt            # 固定学习率（旧）
+python train.py --log loss_log_sched.csv --save model_sched.pt   # 第一版：退火到 0
+python train.py --log loss_log_sched2.csv --save model_sched2.pt # 改进版：退火到 lr/10
+python plot_loss.py --log loss_log.csv --log2 loss_log_sched2.csv --name1 "固定学习率" --name2 "退火到lr/10" --out assets/loss_sched2_compare.png
+```
 
 ## 本项目 vs 真正的大模型
 
