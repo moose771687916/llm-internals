@@ -50,7 +50,7 @@ def main():
     ap = argparse.ArgumentParser(description="用训练好的迷你 GPT 生成文本")
     ap.add_argument("--model", default="model.pt", help="训练好的权重文件路径")
     ap.add_argument("--prompt", default="ROMEO:", help="开头文字（模型从这里开始往下编）")
-    ap.add_argument("--length", type=int, default=500, help="生成多少个字符")
+    ap.add_argument("--length", type=int, default=500, help="生成多少个 token（字符级≈字符数；BPE 级 1 个 token 可能是一个词）")
     ap.add_argument("--temperature", type=float, default=0.8, help="随机性（0.1保守 ~ 1.5疯狂）")
     args = ap.parse_args()
 
@@ -90,16 +90,29 @@ def main():
     #   - BatchNorm 等层用训练时统计的均值方差，而不是当前 batch 的
     #   我们的模型里有 Dropout，所以必须调 eval()，否则每次生成结果会随机乱跳。
 
-    # 取出词表映射
-    itos = ckpt["itos"]  # id → 字符，生成完用来把数字变回文字
-    stoi = ckpt["stoi"]  # 字符 → id，用来把 prompt 变成数字
+    # 取出词表映射（按分词方式：char 或 bpe）
+    tokenizer_type = ckpt.get("tokenizer_type", "char")
+    # ↑ 旧模型（实验 1~5）没有这个字段，默认 char（字符级），保持完全兼容
+    if tokenizer_type == "bpe":
+        # ---- BPE 模式（实验 6）：用保存的合并规则重建分词器 ----
+        from tokenizer import BPETokenizer
+        tok = BPETokenizer()
+        tok.merges = ckpt["merges"]        # 合并规则（训练时学的）
+        tok.vocab = ckpt["vocab"]          # 词表 {id: 文本片段}
+        tok.char_to_id = ckpt["char_to_id"]  # 初始字符 → id
+        encode = tok.encode   # 文本 → token id 列表
+        decode = tok.decode   # token id 列表 → 文本
+        # ↑ BPE 模式下 1 个 token 可能是一个词/片段，不是单个字符
+    else:
+        # ---- 字符级模式（默认）----
+        itos = ckpt["itos"]  # id → 字符，生成完用来把数字变回文字
+        stoi = ckpt["stoi"]  # 字符 → id，用来把 prompt 变成数字
+        encode = lambda s: [stoi[c] for c in s]
+        decode = lambda ids: "".join(itos[int(i)] for i in ids)
 
     # ==========================================================================
     # 【第 2 步：把开头（prompt）变成数字】
     # ==========================================================================
-    encode = lambda s: [stoi[c] for c in s]
-    # ↑ 和 train.py 里一样的编码函数：字符串 → id 列表
-
     context = torch.tensor([encode(args.prompt)], dtype=torch.long)
     # ↑ 把 prompt 编码成 id 列表，再包一层变成 (1, T) 形状的张量
     #   前面的 1 是 batch 大小（一次只生成一条）
@@ -118,10 +131,10 @@ def main():
     # ==========================================================================
     # 【第 4 步：把数字变回文字，打印出来】
     # ==========================================================================
-    generated_text = "".join(itos[int(i)] for i in out[0].tolist())
-    # ↑ out[0] 取出第一条（也是唯一一条）数据，形状 (T+length,)
-    #   .tolist() 把张量转成 Python 列表
-    #   遍历每个 id，用 itos 字典查回字符，再用 "".join() 拼成一个字符串
+    generated_text = decode(out[0].tolist())
+    # ↑ decode 把 token id 列表还原成文本：
+    #   - 字符级：每个 id 查 itos 返回一个字符
+    #   - BPE 级：每个 id 查词表返回一个片段（可能是一个词），再拼接
     print(generated_text)
     # ↑ 打印生成的完整文本（包含开头的 prompt）
 

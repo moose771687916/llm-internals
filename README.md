@@ -137,7 +137,9 @@ llm-internals/
 ├── plot_loss.py      # 画图脚本：把训练日志画成 loss 曲线
 ├── peek_weights.py   # 透视脚本：查看训练前后权重变化
 ├── rope_extrapolation.py  # 实验5：RoPE 外推 + NTK 验证脚本
-├── bpe_demo.py       # 实验6（进行中）：BPE 分词器合并过程演示
+├── tokenizer.py       # 实验6：BPE 分词器（训练/编码/解码，GPT-2 同款思路）
+├── compare_bpe.py     # 实验6：字符级 vs BPE 生成对比 + loss 对比图
+├── bpe_demo.py        # 实验6：BPE 合并过程演示（小数据版）
 ├── input.txt         # 训练语料（莎士比亚全集，1.1MB）
 ├── model.pt          # 训练好的权重（824,320 参数）
 ├── loss_log.csv      # 训练日志（step/train loss/val loss，画图用）
@@ -149,13 +151,14 @@ llm-internals/
 
 ## 实验记录
 
-> 持续更新中 —— 五个实验的进行状态：
+> 持续更新中 —— 六个实验的进行状态：
 
 - [x] **loss 曲线可视化**：`python train.py --log loss_log.csv --eval_interval 50` 记录日志 → `python plot_loss.py` 画图（见上方训练效果图）
 - [x] **GELU vs SwiGLU 消融实验**：两版各训 2000 步，参数量基本持平（821,248 vs 824,320，差 0.4%），对比结论见下
 - [x] **训练前后生成效果对比**：随机模型 vs 训练后模型（见下，完整文本在 `assets/before_train.txt` / `assets/after_train.txt`）
 - [x] **学习率调度实验**：固定学习率 vs warmup+余弦退火，三版各训 2000 步，验证"调度威力在长训练"（见下）
 - [x] **RoPE 位置编码升级实验**：绝对位置表 vs RoPE（现代大模型同款）对比 + NTK 外推验证（见下）
+- [x] **BPE 分词器升级实验**：字符级 vs BPE（GPT-2 同款 tokenizer）对比，词表 65 → 2,065（见下）
 
 ### 实验 2：GELU vs SwiGLU 消融
 
@@ -268,6 +271,41 @@ python plot_loss.py --log loss_log.csv --log2 loss_log_rope.csv --name1 "绝对�
 # 外推验证
 python rope_extrapolation.py --model model_rope.pt --extrap_len 256              # 裸 RoPE 外推
 python rope_extrapolation.py --model model_rope.pt --extrap_len 256 --ntk        # NTK 换表外推
+```
+
+### 实验 6：BPE 分词器升级（GPT-2 同款 tokenizer）
+
+![字符级 vs BPE loss 对比](assets/loss_bpe_compare.png)
+
+**背景**：之前一直是"字符级"——1 个字符 = 1 个 token。问题：数据里 "the" 出现几万次，模型每次都要从 `t`、`h`、`e` 重新拼；128 的上下文窗口只能看 128 个字符。
+
+**BPE（字节对编码）思路**：反复合并"出现次数最多的相邻对"，让 `th`、`the␣`、`you` 这种高频片段变成单个 token。**它是纯数据驱动的**——莎士比亚数据自动长出了 `.\n\nQUEEN MARGARET:\n`（完整台词切换块）、`Montagu`（人名）这种 token。
+
+| 项目 | 字符级 | BPE 级 |
+|---|---:|---:|
+| 词表大小 | 65 | 2,065 |
+| 数据表示 | 1,115,394 字符 | 349,135 token（**压缩 3.2 倍**） |
+| 参数量 | 807,936 | 1,319,936 |
+| 随机基线（瞎猜）loss | ln(65) ≈ 4.17 | ln(2065) ≈ 7.63 |
+| 最终 val loss | 1.502 | 4.917 |
+| **换算成"每字符成本"** | **1.50 bits/char** | **4.917 ÷ 3.2 ≈ 1.54 bits/char** |
+
+**结论 1（重要的知识点）**：**loss 不能跨词表直接比**——词表越大，随机猜对的概率越低，随机基线越高（`ln(词表大小)`）。换算成"每字符成本"后两者几乎相当（1.50 vs 1.54），说明同样 2000 步学到的"信息量"一样多。
+
+**结论 2（BPE 的真正价值）**：
+- **有效上下文 ×3.2**：128 token 窗口 = 约 410 字符，模型能"记住"更长的剧情
+- **生成更连贯**：同 seed、同温度对比，BPE 版角色名齐全（LADY CAPULET / POLIXENES / MENENIUS）、台词结构完整，字符级只能蹦短语
+- **学习单元更大**：1 个 token 是一个片段/词，模型不用再学"拼字"
+
+**生成对比（同 seed、同温度 0.8、300 token）**：
+- **字符级**：`ROMEO: Have his wife? fear. ANGELO: The bitter, that hope! Well, as you shine crave we the hopes...`
+- **BPE 级**：`ROMEO: OF SLY: A fares and that What, hares my sir, They have with country's mighty writ... LADY CAPULET: A John, I shall make rather sweet hearts.`
+
+复现方法：
+```bash
+python tokenizer.py                       # 训练 BPE 分词器（词表 2065，保存 bpe_tokenizer.pkl）
+python train.py --tokenizer bpe --pos_enc rope --save model_bpe.pt --log loss_log_bpe.csv  # 训练 BPE 版
+python compare_bpe.py                     # 生成对比 + loss 对比图
 ```
 
 ## 本项目 vs 真正的大模型

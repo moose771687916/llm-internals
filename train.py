@@ -96,6 +96,8 @@ def main():
                     help="位置编码：abs（绝对位置表，GPT-2 经典）或 rope（旋转位置编码，现代大模型）")
     ap.add_argument("--rope_base", type=float, default=10000.0,
                     help="RoPE 转速公式的 base（默认 10000；Qwen 训练时调到百万级以支持长上下文）")
+    ap.add_argument("--tokenizer", default="char", choices=["char", "bpe"],
+                    help="分词方式：char（字符级，1 字符 1 token）或 bpe（字节对编码，GPT-2 同款，词表 ~2000）")
 
     args = ap.parse_args()
     # ↑ 解析命令行，结果存在 args 里。比如 args.max_iters 就是你输入的训练步数。
@@ -114,32 +116,41 @@ def main():
     # ↑ 打开训练文本文件，用 UTF-8 编码读取全部内容，存在 text 字符串里。
     #   莎士比亚数据大约 110 万个字符。
 
-    chars = sorted(list(set(text)))
-    # ↑ set(text) 找出文本里所有"不重复"的字符（比如 a、b、逗号、换行等）
-    #   list() 转成列表，sorted() 排序（保证每次顺序一致）
-    #   莎士比亚数据里有 65 种不同字符
-    vocab_size = len(chars)
-    # ↑ 词表大小 = 有多少种不同字符
+    if args.tokenizer == "bpe":
+        # ---- BPE 分词（实验 6：把词表从 65 扩到 2000+，GPT-2 同款思路）----
+        # BPE（字节对编码）做的事：反复合并"出现次数最多的相邻对"，
+        # 让 "the "、"th"、"you" 这种高频片段变成单个 token。
+        # 好处：① 同样的 128 窗口能装更多内容（压缩 3 倍）② 模型不用反复学"拼字"。
+        # 词表是提前用 tokenizer.py 在完整数据上学好的（保存为 bpe_tokenizer.pkl）。
+        from tokenizer import BPETokenizer  # 导入同目录 tokenizer.py 里的分词器类
+        tok = BPETokenizer.load("bpe_tokenizer.pkl")
+        vocab_size = len(tok.vocab)  # 词表大小（65 字符 + 2000 次合并 ≈ 2065）
+        data = torch.tensor(tok.encode(text), dtype=torch.long)
+        # ↑ encode() 把整段文本切成 token id 序列（不再是"1 字符 = 1 id"）
+        stoi, itos = None, None  # BPE 模式不用字符映射（编码解码全在 tokenizer 里）
+        print(f"数据大小: {len(data):,} token | 词表大小: {vocab_size}（BPE）")
+    else:
+        # ---- 字符级分词（默认，实验 1~5 一直用的方式）----
+        chars = sorted(list(set(text)))
+        # ↑ set(text) 找出文本里所有"不重复"的字符（比如 a、b、逗号、换行等）
+        #   list() 转成列表，sorted() 排序（保证每次顺序一致）
+        #   莎士比亚数据里有 65 种不同字符
+        vocab_size = len(chars)
+        # ↑ 词表大小 = 有多少种不同字符
 
-    # 建立两个映射字典：
-    stoi = {ch: i for i, ch in enumerate(chars)}
-    # ↑ stoi = string to int，字符 → id。比如 {'a': 0, 'b': 1, ...}
-    #   这是一个"字典推导式"，遍历 chars 列表，每个字符分配一个递增的 id。
-    itos = {i: ch for i, ch in enumerate(chars)}
-    # ↑ itos = int to string，id → 字符。比如 {0: 'a', 1: 'b', ...}
-    #   生成完文本后，用这个字典把数字变回字符。
+        # 建立两个映射字典：
+        stoi = {ch: i for i, ch in enumerate(chars)}
+        # ↑ stoi = string to int，字符 → id。比如 {'a': 0, 'b': 1, ...}
+        #   这是一个"字典推导式"，遍历 chars 列表，每个字符分配一个递增的 id。
+        itos = {i: ch for i, ch in enumerate(chars)}
+        # ↑ itos = int to string，id → 字符。比如 {0: 'a', 1: 'b', ...}
+        #   生成完文本后，用这个字典把数字变回字符。
 
-    encode = lambda s: [stoi[c] for c in s]
-    # ↑ encode 是一个小函数（lambda 匿名函数）：输入字符串，输出 id 列表。
-    #   比如 encode("abc") → [0, 1, 2]
-    #   这就是"分词"：把文字变成模型能处理的数字。
-
-    data = torch.tensor(encode(text), dtype=torch.long)
-    # ↑ 把整个文本编码成 id 列表，再转成 PyTorch 张量（long 类型 = 64位整数）
-    #   data 的形状：(1115394,)，一个一维数组，每个元素是一个字符的 id
-
-    print(f"数据大小: {len(data):,} 字符 | 词表大小: {vocab_size}")
-    # ↑ f-string 格式化输出。{len(data):,} 表示数字加千分位逗号（1,115,394）
+        data = torch.tensor([stoi[c] for c in text], dtype=torch.long)
+        # ↑ 把整个文本编码成 id 列表，再转成 PyTorch 张量（long 类型 = 64位整数）
+        #   data 的形状：(1115394,)，一个一维数组，每个元素是一个字符的 id
+        print(f"数据大小: {len(data):,} 字符 | 词表大小: {vocab_size}")
+        # ↑ f-string 格式化输出。{len(data):,} 表示数字加千分位逗号（1,115,394）
 
     # ---- 划分训练集和验证集 ----
     n = int(0.9 * len(data))
@@ -300,19 +311,23 @@ def main():
     # ==========================================================================
     # 【第 6 步：保存模型】
     # ==========================================================================
-    torch.save(
-        {
-            "model": model.state_dict(),   # 模型的所有权重（一个字典）
-            "stoi": stoi,                  # 字符→id 映射（生成时需要）
-            "itos": itos,                  # id→字符 映射（生成时需要）
-            "vocab_size": vocab_size,      # 词表大小
-            "config": vars(args),          # 训练时用的所有超参数（重建模型需要）
-        },
-        args.save,
-    )
+    save_dict = {
+        "model": model.state_dict(),   # 模型的所有权重（一个字典）
+        "vocab_size": vocab_size,      # 词表大小
+        "config": vars(args),          # 训练时用的所有超参数（重建模型需要）
+        "tokenizer_type": args.tokenizer,  # 分词方式（generate.py 需要知道怎么解码）
+    }
     # ↑ torch.save 把一个 Python 对象序列化成二进制文件存到磁盘。
     #   state_dict() 返回模型所有权重的字典（key 是层名，value 是权重张量）。
-    #   我们同时存了词表和配置，这样 generate.py 加载时能完整重建模型。
+    if args.tokenizer == "bpe":
+        # BPE 模式：把词表和合并规则一起存（generate.py 解码要用）
+        save_dict["merges"] = tok.merges      # 合并规则 {(旧id,旧id): 新id}
+        save_dict["vocab"] = tok.vocab        # 词表 {id: 文本片段}
+        save_dict["char_to_id"] = tok.char_to_id  # 初始字符 → id
+    else:
+        save_dict["stoi"] = stoi   # 字符→id 映射（生成时需要）
+        save_dict["itos"] = itos   # id→字符 映射（生成时需要）
+    torch.save(save_dict, args.save)
     print(f"训练完成，模型已保存到 {args.save}")
 
     if log_file is not None:
