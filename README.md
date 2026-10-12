@@ -136,6 +136,8 @@ llm-internals/
 ├── generate.py       # 推理脚本：用训练好的模型生成文本
 ├── plot_loss.py      # 画图脚本：把训练日志画成 loss 曲线
 ├── peek_weights.py   # 透视脚本：查看训练前后权重变化
+├── rope_extrapolation.py  # 实验5：RoPE 外推 + NTK 验证脚本
+├── bpe_demo.py       # 实验6（进行中）：BPE 分词器合并过程演示
 ├── input.txt         # 训练语料（莎士比亚全集，1.1MB）
 ├── model.pt          # 训练好的权重（824,320 参数）
 ├── loss_log.csv      # 训练日志（step/train loss/val loss，画图用）
@@ -147,7 +149,7 @@ llm-internals/
 
 ## 实验记录
 
-> 持续更新中 —— 四个实验的进行状态：
+> 持续更新中 —— 五个实验的进行状态：
 
 - [x] **loss 曲线可视化**：`python train.py --log loss_log.csv --eval_interval 50` 记录日志 → `python plot_loss.py` 画图（见上方训练效果图）
 - [x] **GELU vs SwiGLU 消融实验**：两版各训 2000 步，参数量基本持平（821,248 vs 824,320，差 0.4%），对比结论见下
