@@ -75,6 +75,8 @@ def main():
         n_layer=cfg["n_layer"],
         block_size=cfg["block_size"],
         activation=cfg.get("activation", "gelu"),  # 兼容 SwiGLU 版模型（旧模型默认 gelu）
+        pos_enc=cfg.get("pos_enc", "abs"),          # 兼容 RoPE 版模型（旧模型默认 abs）
+        rope_base=cfg.get("rope_base", 10000.0),    # 兼容改过 base 的 RoPE 模型（默认 10000）
     )
 
     # 把训练好的权重"装"进这个空模型

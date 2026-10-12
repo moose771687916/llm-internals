@@ -153,6 +153,7 @@ llm-internals/
 - [x] **GELU vs SwiGLU 消融实验**：两版各训 2000 步，参数量基本持平（821,248 vs 824,320，差 0.4%），对比结论见下
 - [x] **训练前后生成效果对比**：随机模型 vs 训练后模型（见下，完整文本在 `assets/before_train.txt` / `assets/after_train.txt`）
 - [x] **学习率调度实验**：固定学习率 vs warmup+余弦退火，三版各训 2000 步，验证"调度威力在长训练"（见下）
+- [x] **RoPE 位置编码升级实验**：绝对位置表 vs RoPE（现代大模型同款）对比 + NTK 外推验证（见下）
 
 ### 实验 2：GELU vs SwiGLU 消融
 
@@ -225,6 +226,46 @@ python train.py --log loss_log.csv --save model.pt            # 固定学习率�
 python train.py --log loss_log_sched.csv --save model_sched.pt   # 第一版：退火到 0
 python train.py --log loss_log_sched2.csv --save model_sched2.pt # 改进版：退火到 lr/10
 python plot_loss.py --log loss_log.csv --log2 loss_log_sched2.csv --name1 "固定学习率" --name2 "退火到lr/10" --out assets/loss_sched2_compare.png
+```
+
+### 实验 5：RoPE 位置编码升级 + NTK 外推验证
+
+![绝对位置表 vs RoPE 对比](assets/loss_rope_compare.png)
+
+**背景**：位置编码有两种主流方案——
+- **绝对位置表**（GPT-2 经典）：给每个位置一个可学习向量，"查表"式。位置信息靠"加法"注入。
+- **RoPE 旋转位置编码**（Llama/DeepSeek/Qwen 现代大模型）：把 Q/K 向量按位置"旋转一个角度"，位置写进向量的方向里。公式 `θ = base^(-2i/d)`，**0 个可学习参数**；点积只看相对距离，天然能外推到训练时没见过的新位置。
+
+**训练对比（各 2000 步，其他配置完全相同）**：
+
+| 版本 | 参数量 | 最终 train loss | 最终 val loss |
+|---|---|---:|---:|
+| 绝对位置表（GPT-2 经典） | 824,320 | 1.478 | 1.642 |
+| **RoPE（现代大模型同款）** | **807,936** | **1.419** | **1.502** |
+
+**结论 1**：RoPE 省掉了位置表（少 16,384 参数），且验证 loss 全面更低（1.502 vs 1.642）——"现代大模型为什么都换 RoPE"有数据支撑。
+
+**外推验证**（训练时上下文 128，推理时一次性输入 256 字符，即 2 倍训练长度）：
+
+| 方案 | 256 字符 loss |
+|---|---:|
+| 随机基线（瞎猜 65 个字符） | 4.174 |
+| 裸 RoPE 直接外推 | 1.435 |
+| **NTK-aware 缩放（只换频率表，模型参数不动）** | **1.256** |
+| 改 base 训练（Qwen 式，base 10,000→20,946） | 1.504 |
+
+**结论 2**：
+- **RoPE 能外推到 2 倍训练长度**（loss 仍远低于随机基线）；绝对位置表做不到——位置表只有 128 行，查不到新位置，直接报错。
+- **NTK-aware 缩放进一步改善外推**（1.435 → 1.256）：把"超出训练范围的旋转角度"压回模型熟悉的范围内，模型参数一个不动，只重算频率表。这正是 Qwen 训练时把 base 从 10,000 调到 100 万、DeepSeek 用 YaRN 做长上下文的技术基础。
+
+复现方法：
+```bash
+# 训练对比
+python train.py --pos_enc rope --save model_rope.pt --log loss_log_rope.csv
+python plot_loss.py --log loss_log.csv --log2 loss_log_rope.csv --name1 "绝对位置表" --name2 "RoPE" --out assets/loss_rope_compare.png
+# 外推验证
+python rope_extrapolation.py --model model_rope.pt --extrap_len 256              # 裸 RoPE 外推
+python rope_extrapolation.py --model model_rope.pt --extrap_len 256 --ntk        # NTK 换表外推
 ```
 
 ## 本项目 vs 真正的大模型

@@ -92,6 +92,10 @@ def main():
     ap.add_argument("--log", default="", help="训练日志 CSV 路径（记录每步 loss，留空则不记录）")
     ap.add_argument("--activation", default="gelu", choices=["gelu", "swiglu"],
                     help="MLP 激活函数：gelu（经典）或 swiglu（现代大模型版）")
+    ap.add_argument("--pos_enc", default="abs", choices=["abs", "rope"],
+                    help="位置编码：abs（绝对位置表，GPT-2 经典）或 rope（旋转位置编码，现代大模型）")
+    ap.add_argument("--rope_base", type=float, default=10000.0,
+                    help="RoPE 转速公式的 base（默认 10000；Qwen 训练时调到百万级以支持长上下文）")
 
     args = ap.parse_args()
     # ↑ 解析命令行，结果存在 args 里。比如 args.max_iters 就是你输入的训练步数。
@@ -154,6 +158,8 @@ def main():
         n_layer=args.n_layer,
         block_size=args.block_size,
         activation=args.activation,  # 激活函数：gelu 或 swiglu（消融实验用）
+        pos_enc=args.pos_enc,        # 位置编码：abs（绝对位置表）或 rope（旋转位置编码）
+        rope_base=args.rope_base,    # RoPE 转速公式的 base（Qwen 式：训练时调大支持长上下文）
     )
     # ↑ 按 model.py 里的图纸，创建一个 GPT 模型实例。
     #   这一步会：创建所有权重张量（随机初始化）、注册所有子模块。

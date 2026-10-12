@@ -98,6 +98,39 @@ class LayerNorm(nn.Module):
 
 
 # ==============================================================================
+# 【零件 1.5：RoPE 旋转位置编码（现代大模型同款）】
+# ==============================================================================
+# 绝对位置表（零件 2 的 GPT 类里）是"查表"：把位置当字符查向量。
+# RoPE 不是查表，而是把 Q/K 向量本身"按位置转个角度"——位置信息写进向量的方向里。
+# 关键性质：点积只看"相对距离"（|i-j|），不看"第几位"，所以可以外推到
+# 训练时没见过的新位置。旋转公式没有任何可学习参数（0 参数，纯数学规则）。
+
+def apply_rope(q, k, cos, sin):
+    """把 Q、K 的最后一维（head_dim）按位置旋转 —— RoPE 核心。
+    q/k: (B, n_head, T, head_dim)；cos/sin: (1, 1, T, head_dim//2) 每对"钟"的角度
+    """
+    shape = q.shape
+    # 把 head_dim 拆成 head_dim//2 对（每对 2 个数 = 一个"钟"）
+    # 第 0 对 = (数字0, 数字1)，第 1 对 = (数字2, 数字3)，……
+    q = q.view(*shape[:-1], -1, 2)   # (B, n_head, T, d/2, 2)
+    k = k.view(*shape[:-1], -1, 2)
+    q0, q1 = q[..., 0], q[..., 1]    # 每对的第 1 个数、第 2 个数
+    k0, k1 = k[..., 0], k[..., 1]
+    # 2 维旋转公式（和初中三角函数一模一样）：
+    #   x' = x·cosθ − y·sinθ
+    #   y' = x·sinθ + y·cosθ
+    # 这里 θ 是"位置 × 转速"（cos/sin 已算好），广播到每个 batch 和每个头
+    q0n = q0 * cos - q1 * sin
+    q1n = q0 * sin + q1 * cos
+    k0n = k0 * cos - k1 * sin
+    k1n = k0 * sin + k1 * cos
+    # 把旋转后的两半拼回原来的形状
+    q = torch.stack((q0n, q1n), dim=-1).view(shape)
+    k = torch.stack((k0n, k1n), dim=-1).view(shape)
+    return q, k
+
+
+# ==============================================================================
 # 【零件 2：CausalSelfAttention —— 带掩码的多头自注意力（GPT 的心脏）】
 # ==============================================================================
 # 这是整个 GPT 最核心、最难理解的部分。我用大白话讲清楚：
@@ -125,17 +158,20 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, n_embd, n_head, block_size, dropout=0.0):
+    def __init__(self, n_embd, n_head, block_size, dropout=0.0, pos_enc="abs", rope_base=10000.0):
         # ↑ n_embd：每个字符用多少个数表示（特征维度，比如 128）
         #   n_head：分成几个头（比如 4）
         #   block_size：上下文最大长度（一次最多看多少个字符，比如 128）
         #   dropout：随机丢弃比例（训练时随机把一些神经元置 0，防止过拟合）
+        #   pos_enc：位置编码方式 "abs"=绝对位置表（GPT-2 经典）/ "rope"=旋转位置编码（现代大模型）
+        #   rope_base：RoPE 转速公式里的 base（默认 10000；Qwen 训练时把它调到百万级）
         super().__init__()
         assert n_embd % n_head == 0
         # ↑ 断言：特征维度必须能被头数整除，因为要平均分给每个头。
         #   比如 128 维 / 4 头 = 每个头 32 维。
         self.n_head = n_head
         self.head_dim = n_embd // n_head  # 每个头分到的维度
+        self.pos_enc = pos_enc
 
         # ---- 核心权重矩阵 ----
         # 一个线性层同时算出 Q、K、V（把三个矩阵拼在一起，效率更高）
@@ -161,6 +197,22 @@ class CausalSelfAttention(nn.Module):
             torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size),
         )
 
+        # ---- RoPE 频率表（pos_enc="rope" 时才需要）----
+        # 预先把每个位置的 cos/sin 角度算好存起来（buffer，不参与训练），
+        # 前向时直接查表用，省得每次现算三角函数。
+        if pos_enc == "rope":
+            # 转速公式：θ_i = rope_base^(-2i/head_dim)，i = 0..head_dim/2-1
+            # 第 0 个"钟"转最快（θ=1.0 弧度/步），最后 1 个"钟"转最慢
+            # base 越大 → 所有钟转速越慢 → 角度分布越平缓（Qwen 训练时把 base 调到 100 万）
+            inv_freq = 1.0 / (rope_base ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+            # ↑ head_dim=32 时：arange(0,32,2)=[0,2,4,...,30]
+            #   10000^(-2i/32) = [1.0, 0.75, 0.56, ...] —— 从快到慢的 16 个转速
+            t = torch.arange(block_size).float().unsqueeze(1) * inv_freq.unsqueeze(0)
+            # ↑ 位置 × 转速 → 每个位置、每个"钟"转了多少弧度。(block_size, head_dim/2)
+            #   视角 1 转 1θ，位置 2 转 2θ……和讲过的"秒针/年钟"完全对应
+            self.register_buffer("cos", t.cos().view(1, 1, block_size, -1))  # (1,1,T,d/2)
+            self.register_buffer("sin", t.sin().view(1, 1, block_size, -1))
+
     def forward(self, x):
         # ↑ x 的形状：(B, T, C)，C = n_embd
         B, T, C = x.shape  # 解包出三个维度的大小
@@ -176,6 +228,12 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         # 现在 q/k/v 的形状都是 (B, n_head, T, head_dim)
+
+        # ---- 第二步半：RoPE 旋转（pos_enc="rope" 时）----
+        # 在算点积之前，把 Q 和 K 按各自位置旋转（V 不转——它只是内容，不参与"找谁相关"）。
+        # 旋转之后点积就带着"相对距离"信号（cos 偶函数：只认距离不认方向，方向由掩码管）。
+        if self.pos_enc == "rope":
+            q, k = apply_rope(q, k, self.cos[:, :, :T, :], self.sin[:, :, :T, :])
 
         # ---- 第三步：算注意力分数 ----
         # 注意力分数 = Q · K^T / sqrt(head_dim)
@@ -272,10 +330,10 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, n_embd, n_head, block_size, dropout=0.0, activation="gelu"):
+    def __init__(self, n_embd, n_head, block_size, dropout=0.0, activation="gelu", pos_enc="abs", rope_base=10000.0):
         super().__init__()
         self.ln1 = LayerNorm(n_embd)       # 注意力前的归一化
-        self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout)  # 注意力
+        self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout, pos_enc, rope_base)  # 注意力
         self.ln2 = LayerNorm(n_embd)       # MLP 前的归一化
         self.mlp = MLP(n_embd, dropout, activation)  # 前馈网络（gelu 或 swiglu）
 
@@ -299,15 +357,18 @@ class Block(nn.Module):
 class GPT(nn.Module):
 
     def __init__(self, vocab_size, n_embd=128, n_head=4, n_layer=4,
-                 block_size=128, dropout=0.0, activation="gelu"):
+                 block_size=128, dropout=0.0, activation="gelu", pos_enc="abs", rope_base=10000.0):
         # ↑ vocab_size：词表大小（有多少种不同的字符，我们的莎士比亚数据是 65）
         #   n_embd：每个字符用多少个数表示（向量维度）
         #   n_head：注意力头数
         #   n_layer：堆多少个 Transformer 层（这就是"权重的层数"）
         #   block_size：上下文最大长度
         #   activation：MLP 激活函数（"gelu" 经典版 / "swiglu" 现代大模型版）
+        #   pos_enc：位置编码（"abs"=绝对位置表 GPT-2 经典 / "rope"=旋转位置编码 现代大模型）
+        #   rope_base：RoPE 转速公式的 base（默认 10000；Qwen 训练时调大到百万级支持长上下文）
         super().__init__()
         self.block_size = block_size
+        self.pos_enc = pos_enc
 
         # ---- 嵌入层 ----
         # 词嵌入：把每个字符 id 映射成一个 n_embd 维的向量
@@ -315,15 +376,18 @@ class GPT(nn.Module):
         # 训练过程中，这些向量会逐渐学到"字符的含义"（比如 'a' 和 'b' 的向量会不同）
         self.token_embedding = nn.Embedding(vocab_size, n_embd)
 
-        # 位置嵌入：给每个"位置"一个向量。因为注意力本身不关心顺序（把字符打乱结果一样），
-        # 所以必须显式告诉模型"这个字符在第几个位置"。
-        # 内部权重矩阵 shape=[block_size, n_embd]，每行是一个位置的向量
-        self.position_embedding = nn.Embedding(block_size, n_embd)
+        # 位置编码：两种方式二选一
+        # "abs"：位置嵌入表。给每个"位置"一个向量（GPT-2 经典做法）。
+        #        内部权重矩阵 shape=[block_size, n_embd]，每行是一个位置的向量
+        # "rope"：不建表！RoPE 的旋转公式没有任何可学习参数，
+        #         cos/sin 表在注意力层里用公式算（0 参数，还能外推到新位置）
+        if pos_enc == "abs":
+            self.position_embedding = nn.Embedding(block_size, n_embd)
 
         # ---- 堆叠 n_layer 个 Transformer 层 ----
         # ModuleList 是 PyTorch 专门放"一堆子模块"的容器，会自动注册里面的参数
         self.blocks = nn.ModuleList(
-            [Block(n_embd, n_head, block_size, dropout, activation)
+            [Block(n_embd, n_head, block_size, dropout, activation, pos_enc, rope_base)
              for _ in range(n_layer)]
         )
 
@@ -361,10 +425,15 @@ class GPT(nn.Module):
 
         # ---- 第一步：嵌入 ----
         tok = self.token_embedding(idx)              # (B, T, n_embd)，每个字符变成向量
-        pos = self.position_embedding(
-            torch.arange(T, device=idx.device)
-        )                                             # (T, n_embd)，每个位置的向量
-        x = tok + pos                                 # 字符向量 + 位置向量 = 带位置信息的输入
+        if self.pos_enc == "abs":
+            # 绝对位置表：字符向量 + 位置向量（位置信息靠"加"进去）
+            pos = self.position_embedding(
+                torch.arange(T, device=idx.device)
+            )                                        # (T, n_embd)，每个位置的向量
+            x = tok + pos                            # 字符向量 + 位置向量 = 带位置信息的输入
+        else:
+            # RoPE：不加法！位置信息由注意力层里对 Q/K 的"旋转"提供（见 CausalSelfAttention）
+            x = tok
 
         # ---- 第二步：流过所有 Transformer 层 ----
         for blk in self.blocks:
