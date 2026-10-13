@@ -213,8 +213,13 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("cos", t.cos().view(1, 1, block_size, -1))  # (1,1,T,d/2)
             self.register_buffer("sin", t.sin().view(1, 1, block_size, -1))
 
-    def forward(self, x):
+    def forward(self, x, layer_cache=None, pos_offset=0):
         # ↑ x 的形状：(B, T, C)，C = n_embd
+        #   layer_cache：KV Cache 的缓存 dict（{"k": ..., "v": ...}）。传了就启用"增量模式"：
+        #                 把本层的 K/V 拼进缓存，注意力拿"全部历史 K/V"计算，不用重算旧位置。
+        #                 不传 = 原版全量模式（行为完全不变）。
+        #   pos_offset：当前输入 x 在完整序列里的起始位置。增量模式下，x 只有最后 1 个位置，
+        #                RoPE 的旋转角必须按"它在全文中的真实位置"取（而不是从 0 重新数）。
         B, T, C = x.shape  # 解包出三个维度的大小
 
         # ---- 第一步：算出 Q、K、V ----
@@ -232,26 +237,45 @@ class CausalSelfAttention(nn.Module):
         # ---- 第二步半：RoPE 旋转（pos_enc="rope" 时）----
         # 在算点积之前，把 Q 和 K 按各自位置旋转（V 不转——它只是内容，不参与"找谁相关"）。
         # 旋转之后点积就带着"相对距离"信号（cos 偶函数：只认距离不认方向，方向由掩码管）。
+        # 关键：切片起点是 pos_offset 而不是 0——增量模式下新位置必须按真实位置取旋转角。
         if self.pos_enc == "rope":
-            q, k = apply_rope(q, k, self.cos[:, :, :T, :], self.sin[:, :, :T, :])
+            q, k = apply_rope(
+                q, k,
+                self.cos[:, :, pos_offset:pos_offset + T, :],
+                self.sin[:, :, pos_offset:pos_offset + T, :],
+            )
+
+        # ---- KV Cache：把历史 K/V 拼进来（增量生成时）----
+        # 预填充阶段：cache 是空 dict，直接把本层 K/V 存进去（首次赋值）。
+        # 增量阶段：cache 里有旧 K/V，把新算的拼在"位置维"（dim=2）后面，
+        #           以后注意力就能拿"全部历史的 K/V"直接用，旧位置再也不重算。
+        if layer_cache is not None:
+            if "k" in layer_cache:
+                k = torch.cat([layer_cache["k"], k], dim=2)  # (B, n_head, T_旧+T_新, head_dim)
+                v = torch.cat([layer_cache["v"], v], dim=2)
+            layer_cache["k"] = k
+            layer_cache["v"] = v
 
         # ---- 第三步：算注意力分数 ----
         # 注意力分数 = Q · K^T / sqrt(head_dim)
         # 为什么除以 sqrt(head_dim)：防止维度大时点积结果太大，导致 softmax 后梯度消失
+        T_total = k.shape[2]  # 历史 + 新位置的总长度（增量模式 > T）
         att = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
-        # ↑ @ 是矩阵乘法。q 是 (B, n_head, T, head_dim)，k.transpose 是 (B, n_head, head_dim, T)
-        #   结果形状：(B, n_head, T, T) —— 每个位置对每个位置的注意力分数
+        # ↑ @ 是矩阵乘法。q 是 (B, n_head, T, head_dim)，k.transpose 是 (B, n_head, head_dim, T_total)
+        #   结果形状：(B, n_head, T, T_total) —— 每个查询位置对每个（历史）位置的注意力分数
 
         # ---- 第四步：应用因果掩码 ----
         # 把"未来位置"（上三角）的分数设成负无穷，这样 softmax 后权重就是 0
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+        # 增量模式（T=1、位置=pos_offset）时，下三角的第 pos_offset 行前 pos_offset+1 列全是 1，
+        # 也就是"当前查询能看到自己及所有历史"——掩码天然放行，不会改任何值（安全）。
+        att = att.masked_fill(self.mask[:, :, pos_offset:pos_offset + T, :T_total] == 0, float("-inf"))
 
         # ---- 第五步：softmax 归一化成权重 ----
         att = F.softmax(att, dim=-1)  # 对最后一维做 softmax，每行加起来等于 1
         att = self.dropout(att)        # 训练时随机丢弃一些注意力连接
 
         # ---- 第六步：用权重对 V 加权求和 ----
-        y = att @ v  # (B, n_head, T, T) @ (B, n_head, T, head_dim) = (B, n_head, T, head_dim)
+        y = att @ v  # (B, n_head, T, T_total) @ (B, n_head, T_total, head_dim) = (B, n_head, T, head_dim)
 
         # ---- 第七步：把多头拼回来 ----
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -337,9 +361,11 @@ class Block(nn.Module):
         self.ln2 = LayerNorm(n_embd)       # MLP 前的归一化
         self.mlp = MLP(n_embd, dropout, activation)  # 前馈网络（gelu 或 swiglu）
 
-    def forward(self, x):
+    def forward(self, x, layer_cache=None, pos_offset=0):
+        # layer_cache：本层的 KV 缓存 dict，透传给注意力（没有就正常全量算）
+        # pos_offset：当前输入在完整序列里的起始位置，透传给注意力（RoPE 取旋转角用）
         # 先归一化 → 注意力 → 残差加回来
-        x = x + self.attn(self.ln1(x))
+        x = x + self.attn(self.ln1(x), layer_cache, pos_offset)
         # 再归一化 → MLP → 残差加回来
         x = x + self.mlp(self.ln2(x))
         return x
@@ -412,10 +438,12 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, cache=None, pos_offset=0):
         """
         idx：输入的字符 id 序列，形状 (B, T)
         targets：可选，训练时传入的"正确答案"，形状 (B, T)，每个位置是下一个字符的 id
+        cache：可选，KV Cache 列表，长度 = 层数，每层一个 dict（存 k/v）。传了就启用增量模式
+        pos_offset：当前输入在完整序列里的起始位置（增量模式用于 RoPE / 绝对位置查表）
         返回：(logits, loss)
               logits：每个位置预测下一个字符的"分数"，形状 (B, T, vocab_size)
               loss：预测和正确答案的差距，训练时才有
@@ -427,8 +455,9 @@ class GPT(nn.Module):
         tok = self.token_embedding(idx)              # (B, T, n_embd)，每个字符变成向量
         if self.pos_enc == "abs":
             # 绝对位置表：字符向量 + 位置向量（位置信息靠"加"进去）
+            # pos_offset：增量模式下新位置要按真实位置查表，而不是从 0 重新数
             pos = self.position_embedding(
-                torch.arange(T, device=idx.device)
+                torch.arange(T, device=idx.device) + pos_offset
             )                                        # (T, n_embd)，每个位置的向量
             x = tok + pos                            # 字符向量 + 位置向量 = 带位置信息的输入
         else:
@@ -436,8 +465,10 @@ class GPT(nn.Module):
             x = tok
 
         # ---- 第二步：流过所有 Transformer 层 ----
-        for blk in self.blocks:
-            x = blk(x)
+        for i, blk in enumerate(self.blocks):
+            # 每层把缓存 dict 透传下去（cache=None 时和原版完全一样）
+            layer_cache = cache[i] if cache is not None else None
+            x = blk(x, layer_cache, pos_offset)
 
         # ---- 第三步：最终归一化 + 输出层 ----
         x = self.ln_f(x)
@@ -463,6 +494,9 @@ class GPT(nn.Module):
         idx：开头序列，形状 (1, T)（batch 为 1，一次只生成一条）
         max_new_tokens：要生成多少个新字符
         temperature：温度，控制随机性。越小越保守（总选概率最大的），越大越随机
+
+        【本版本 = 朴素版（无 KV Cache）】每一步都把最近 block_size 个字符
+        全量过一遍模型，历史位置的 K/V 每次都重新算——生成越长越浪费。
         """
         for _ in range(max_new_tokens):
             # 只取最近的 block_size 个字符（模型一次最多看这么多）
@@ -482,6 +516,48 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)  # (1, 1)
 
             # 把新字符拼到序列末尾
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
+    @torch.no_grad()
+    def generate_cached(self, idx, max_new_tokens, temperature=1.0):
+        """
+        KV Cache 版生成（实验 7）——生成结果和 generate() 逐字相同，但快得多。
+
+        【核心思想】生成第 N 个 token 时，注意力要"回顾"前 N-1 个 token 的 K/V。
+        朴素版每步把整个序列重新过一遍，历史 K/V 白白重算 N-1 份。
+        Cache 版只算新位置：
+          1. 预填充（prefill）：开头序列一次过完，顺手把每层的 K/V 存进缓存
+          2. 增量生成：每步只输入"最后 1 个位置"，算出它的 K/V 拼进缓存尾巴，
+             注意力直接拿"缓存里的全部历史 K/V"算，旧位置零重算
+
+        【前提】本实验的 cos/sin 表是按 block_size 预计算的，所以
+        预填充长度 + 生成长度必须 ≤ block_size（真实实现会动态扩展表）。
+        """
+        idx = idx.clone()
+        prefill_len = idx.shape[1]
+        assert prefill_len + max_new_tokens <= self.block_size, \
+            f"预填充 {prefill_len} + 生成 {max_new_tokens} 超过 block_size={self.block_size}（真实实现会动态扩展）"
+
+        # ---- 1. 预填充（prefill）：全量过一遍 + 缓存 K/V + 采样第一个新 token ----
+        caches = [{} for _ in self.blocks]   # 每层一个缓存 dict（{"k":..., "v":...}）
+        logits, _ = self(idx, cache=caches, pos_offset=0)  # 缓存位置 0..prefill_len-1
+        # 用 prompt 最后位置的分数直接采样第一个新 token（不用再跑一次增量）
+        logits = logits[:, -1, :] / temperature
+        idx_next = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+        idx = torch.cat((idx, idx_next), dim=1)
+
+        # ---- 2. 增量生成：每步只算"刚生成的新 token"（它还没进缓存）----
+        # 注意：不能输入 prompt 的最后一个字符——它的 K/V 预填充时已缓存，再算会重复！
+        for i in range(max_new_tokens - 1):
+            idx_last = idx[:, -1:]                    # 刚生成的新 token，位置 = prefill_len + i
+            # 它的 QKV 全量算出：K/V 拼进缓存（新位置，零重复），Q 直接查历史
+            logits, _ = self(idx_last, cache=caches, pos_offset=prefill_len + i)
+
+            logits = logits[:, -1, :] / temperature
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)  # (1, 1)
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx

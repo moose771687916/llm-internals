@@ -140,6 +140,7 @@ llm-internals/
 ├── tokenizer.py       # 实验6：BPE 分词器（训练/编码/解码，GPT-2 同款思路）
 ├── compare_bpe.py     # 实验6：字符级 vs BPE 生成对比 + loss 对比图
 ├── bpe_demo.py        # 实验6：BPE 合并过程演示（小数据版）
+├── kv_cache_demo.py   # 实验7：KV Cache 推理加速对比（无缓存 vs 缓存）
 ├── input.txt         # 训练语料（莎士比亚全集，1.1MB）
 ├── model.pt          # 训练好的权重（824,320 参数）
 ├── loss_log.csv      # 训练日志（step/train loss/val loss，画图用）
@@ -151,7 +152,7 @@ llm-internals/
 
 ## 实验记录
 
-> 持续更新中 —— 六个实验的进行状态：
+> 持续更新中 —— 七个实验的进行状态：
 
 - [x] **loss 曲线可视化**：`python train.py --log loss_log.csv --eval_interval 50` 记录日志 → `python plot_loss.py` 画图（见上方训练效果图）
 - [x] **GELU vs SwiGLU 消融实验**：两版各训 2000 步，参数量基本持平（821,248 vs 824,320，差 0.4%），对比结论见下
@@ -159,6 +160,7 @@ llm-internals/
 - [x] **学习率调度实验**：固定学习率 vs warmup+余弦退火，三版各训 2000 步，验证"调度威力在长训练"（见下）
 - [x] **RoPE 位置编码升级实验**：绝对位置表 vs RoPE（现代大模型同款）对比 + NTK 外推验证（见下）
 - [x] **BPE 分词器升级实验**：字符级 vs BPE（GPT-2 同款 tokenizer）对比，词表 65 → 2,065（见下）
+- [x] **KV Cache 推理加速实验**：无缓存 vs KV Cache 生成对比，结果逐字一致 + 加速比随长度增长（见下）
 
 ### 实验 2：GELU vs SwiGLU 消融
 
@@ -306,6 +308,37 @@ python rope_extrapolation.py --model model_rope.pt --extrap_len 256 --ntk       
 python tokenizer.py                       # 训练 BPE 分词器（词表 2065，保存 bpe_tokenizer.pkl）
 python train.py --tokenizer bpe --pos_enc rope --save model_bpe.pt --log loss_log_bpe.csv  # 训练 BPE 版
 python compare_bpe.py                     # 生成对比 + loss 对比图
+```
+
+### 实验 7：KV Cache 推理加速（所有大模型推理都在用的优化）
+
+**背景**：朴素生成每生成 1 个新 token，都把整个序列重新过一遍模型——历史位置的 K/V 每次都重算，第 N 步白白重算 N-1 份。生成 120 token 就是 1+2+...+120 ≈ 7,260 份位置计算，99% 是重复劳动。
+
+**思路**（用显存换时间）：
+- **预填充（prefill）**：prompt 一次过完，每层把 K/V 存进缓存
+- **增量生成**：每步只输入"刚生成的新 token"，算出它的 K/V 拼进缓存尾巴，注意力直接拿"全部历史 K/V"用——旧位置零重算
+
+**实现**：`model.py` 的注意力 forward 增加可选参数 `layer_cache`（存 K/V）和 `pos_offset`（新位置的真实位置，RoPE 旋转角按它取）；新增 `GPT.generate_cached()`。默认参数不变，旧模型文件照常加载。
+
+**正确性验证（关键）**：同随机种子跑朴素版和 Cache 版，**生成结果必须逐字一致**——缓存只是省重复计算，不能改变任何数学结果。
+
+**性能对比**（CPU，RoPE 版模型，RoMEO 版，温度 0.8，结果全部逐字一致 ✅）：
+
+| 生成长度 | 朴素版耗时 | KV Cache 版耗时 | 加速比 |
+|---|---:|---:|---:|
+| 40 token | 146 ms | 105 ms | 1.39 × |
+| 80 token | 359 ms | 195 ms | 1.84 × |
+| 120 token | 622 ms | 299 ms | **2.08 ×** |
+
+**结论：生成越长，加速越明显**——朴素版每步重算的位置随长度线性增长，缓存版恒定只算 1 个位置。
+
+**为什么只快 2 倍而不是 60 倍？**（重要的工程认知）理论省 60 倍计算量，但实际瓶颈是：①模型太小（4 层 128 维，注意力占比低）；②Python 循环调度和 `torch.cat` 拼接开销省不掉；③CPU 上小张量运算调度成本高。真实大模型（几十层、长上下文、GPU 上矩阵运算占主导）的 KV Cache 收益是 10~100 倍——这也是 ChatGPT / DeepSeek 推理的标配。
+
+**踩过的坑（真实工程教训）**：第一版实现"每步输入 prompt 的最后一个字符"，但它的 K/V 预填充时已缓存——缓存出现重复位置，结果逐字不一致。正确做法：预填充时直接用最后位置的分数采样第一个新 token，循环只输入"刚生成、还没进缓存"的新 token。
+
+复现方法：
+```bash
+python kv_cache_demo.py --model model_rope.pt --length 120
 ```
 
 ## 本项目 vs 真正的大模型
