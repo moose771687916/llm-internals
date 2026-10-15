@@ -70,6 +70,7 @@ def main():
         activation=cfg.get("activation", "gelu"),
         pos_enc="rope",               # ← 必须 rope（绝对位置表无法外推）
         rope_base=cfg.get("rope_base", 10000.0),  # 用训练时的 base（Qwen 式改过 base 也能对上）
+        n_kv_head=cfg.get("n_kv_head", None),
     )
 
     # 加载权重：过滤掉 buffer（mask/cos/sin 大小随 block_size 变，不匹配是正常的）

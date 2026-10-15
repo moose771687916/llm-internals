@@ -24,6 +24,7 @@
 |---|---|
 | **从零手写** | 不使用 HuggingFace、不调 API，每个组件可逐行读 |
 | **双激活可切换** | MLP 支持 GELU（经典）与 SwiGLU（现代大模型），`--activation` 一键对比 |
+| **GQA 可切换** | 注意力支持标准 MHA 与 GQA（K/V 头共享，Llama 2/3 同款），`--n_kv_head` 一键对比 |
 | **教学级注释** | model.py 每行中文注释，注释即教程 |
 | **可复现** | 固定随机种子（1337），2000 步结果可精确复现 |
 | **参数透视** | peek_weights.py 可查看训练前后权重变化 |
@@ -141,6 +142,7 @@ llm-internals/
 ├── compare_bpe.py     # 实验6：字符级 vs BPE 生成对比 + loss 对比图
 ├── bpe_demo.py        # 实验6：BPE 合并过程演示（小数据版）
 ├── kv_cache_demo.py   # 实验7：KV Cache 推理加速对比（无缓存 vs 缓存）
+├── gqa_compare.py     # 实验8：GQA vs 标准 MHA 的 loss 对比图
 ├── input.txt         # 训练语料（莎士比亚全集，1.1MB）
 ├── model.pt          # 训练好的权重（824,320 参数）
 ├── loss_log.csv      # 训练日志（step/train loss/val loss，画图用）
@@ -161,6 +163,7 @@ llm-internals/
 - [x] **RoPE 位置编码升级实验**：绝对位置表 vs RoPE（现代大模型同款）对比 + NTK 外推验证（见下）
 - [x] **BPE 分词器升级实验**：字符级 vs BPE（GPT-2 同款 tokenizer）对比，词表 65 → 2,065（见下）
 - [x] **KV Cache 推理加速实验**：无缓存 vs KV Cache 生成对比，结果逐字一致 + 加速比随长度增长（见下）
+- [x] **GQA 分组查询注意力实验**：K/V 头减半共享（4 Q 头 ↔ 2 K/V 组），省 8.1% 参数、KV 缓存小一半（见下）
 
 ### 实验 2：GELU vs SwiGLU 消融
 
@@ -339,6 +342,41 @@ python compare_bpe.py                     # 生成对比 + loss 对比图
 复现方法：
 ```bash
 python kv_cache_demo.py --model model_rope.pt --length 120
+```
+
+### 实验 8：GQA 分组查询注意力（Llama 2/3 同款，省显存的关键）
+
+**背景**：标准多头注意力（MHA）里每个 Q 头都有自己独立的 K/V 头——4 个 Q 头配 4 组 K/V。但研究发现：**相邻的 Q 头关注的模式很相似**，没必要各自存一份 K/V。GQA 的做法：Q 头保持 4 组不变，K/V 头减半为 2 组，每组 K/V 服务 2 个 Q 头（代码里就是一行 `k.repeat_interleave(2, dim=1)` 复制共享）。
+
+![GQA vs MHA 对比](assets/loss_gqa_compare.png)
+
+**参数账**（n_embd=128、n_head=4、n_kv_head=2、4 层）：
+
+| 版本 | c_attn 输出维 | 每层 c_attn 权重 | 总参数量 | 相对 |
+|---|---:|---:|---:|---:|
+| MHA（实验5 RoPE 版） | Q128+K128+V128=384 | 128×384 | 807,936 | 100% |
+| **GQA（本实验）** | Q128+K64+V64=**256** | 128×256 | **742,400** | **−8.1%** |
+
+省下 65,536 个参数，同时**推理时 KV 缓存也小一半**（K/V 只有 2 组而非 4 组）——长上下文场景显存翻倍的重要来源。
+
+**训练对比**（同 seed、同配置、同样 2000 步，唯一变量 = n_kv_head 4→2）：
+
+| 版本 | 最终 train loss | 最终 val loss |
+|---|---:|---:|
+| MHA | 1.4190 | **1.5021** |
+| GQA | **1.3646** | 1.5567 |
+
+**结论**：GQA 用 8.1% 的参数换来 val loss 只涨 0.055（约 3.6%）——这个"小代价换大显存"的交易就是 Llama 2/3、Mistral 都选 GQA 的原因：省下的 KV 缓存可以去换更长的上下文或更大的 batch，收益远超这点损失。图中 GQA 的 train loss 反而更低，也符合直觉：K/V 共享相当于一种参数约束，小数据上更不容易"背"训练集。
+
+**与实验 7 联动**：KV Cache 在 GQA 模型上依然逐字一致 ✅（加速比 2.13×），且缓存张量天然小一半——GQA 是 KV Cache 的"最佳搭档"。
+
+**踩过的坑（真实工程教训）**：GQA 的 K 只有一半头，从 `qkv.split()` 出来的切片视图在 `transpose` 后内存不连续，RoPE 里的 `view` 直接报错 `view size is not compatible`——改成 `reshape`（非连续时自动安全拷贝）解决。教训：**split/transpose 之后别用 view 改形状**。
+
+复现方法：
+```bash
+python train.py --pos_enc rope --n_kv_head 2 --save model_gqa.pt --log loss_log_gqa.csv  # 训练 GQA 版
+python gqa_compare.py   # 生成对比图 + 打印双方最终 loss
+python kv_cache_demo.py --model model_gqa.pt --length 120  # GQA 上验证 KV Cache
 ```
 
 ## 本项目 vs 真正的大模型

@@ -32,6 +32,7 @@ def load_model(path):
         activation=cfg.get("activation", "gelu"),
         pos_enc=cfg.get("pos_enc", "abs"),
         rope_base=cfg.get("rope_base", 10000.0),
+        n_kv_head=cfg.get("n_kv_head", None),
     )
     model.load_state_dict(ckpt["model"])
     model.eval()

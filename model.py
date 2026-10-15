@@ -107,14 +107,17 @@ class LayerNorm(nn.Module):
 
 def apply_rope(q, k, cos, sin):
     """把 Q、K 的最后一维（head_dim）按位置旋转 —— RoPE 核心。
-    q/k: (B, n_head, T, head_dim)；cos/sin: (1, 1, T, head_dim//2) 每对"钟"的角度
+    q: (B, n_head, T, head_dim)；k: (B, n_kv_head, T, head_dim)（GQA 时头数更少）
+    cos/sin: (1, 1, T, head_dim//2) 每对"钟"的角度
     """
-    shape = q.shape
+    qshape, kshape = q.shape, k.shape
     # 把 head_dim 拆成 head_dim//2 对（每对 2 个数 = 一个"钟"）
     # 第 0 对 = (数字0, 数字1)，第 1 对 = (数字2, 数字3)，……
-    q = q.view(*shape[:-1], -1, 2)   # (B, n_head, T, d/2, 2)
-    k = k.view(*shape[:-1], -1, 2)
-    q0, q1 = q[..., 0], q[..., 1]    # 每对的第 1 个数、第 2 个数
+    # 用 reshape 而不是 view：split/transpose 后内存可能不连续（GQA 的 K 只有一半头，
+    # 是切片视图），view 会报错，reshape 会自动做安全拷贝。
+    q = q.reshape(*qshape[:-1], -1, 2)   # (B, n_head, T, d/2, 2)
+    k = k.reshape(*kshape[:-1], -1, 2)   # (B, n_kv_head, T, d/2, 2)
+    q0, q1 = q[..., 0], q[..., 1]        # 每对的第 1 个数、第 2 个数
     k0, k1 = k[..., 0], k[..., 1]
     # 2 维旋转公式（和初中三角函数一模一样）：
     #   x' = x·cosθ − y·sinθ
@@ -125,8 +128,8 @@ def apply_rope(q, k, cos, sin):
     k0n = k0 * cos - k1 * sin
     k1n = k0 * sin + k1 * cos
     # 把旋转后的两半拼回原来的形状
-    q = torch.stack((q0n, q1n), dim=-1).view(shape)
-    k = torch.stack((k0n, k1n), dim=-1).view(shape)
+    q = torch.stack((q0n, q1n), dim=-1).reshape(qshape)
+    k = torch.stack((k0n, k1n), dim=-1).reshape(kshape)
     return q, k
 
 
@@ -158,9 +161,12 @@ def apply_rope(q, k, cos, sin):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, n_embd, n_head, block_size, dropout=0.0, pos_enc="abs", rope_base=10000.0):
+    def __init__(self, n_embd, n_head, block_size, dropout=0.0, pos_enc="abs", rope_base=10000.0, n_kv_head=None):
         # ↑ n_embd：每个字符用多少个数表示（特征维度，比如 128）
         #   n_head：分成几个头（比如 4）
+        #   n_kv_head：K/V 用几个头（GQA 分组查询注意力，实验 8）。
+        #              None = 和 n_head 一样（标准 MHA，完全兼容旧模型）
+        #              设为更小（如 2）= 多个 Q 头共享同一组 K/V，省参数、省 KV 缓存（Llama 2/3 同款）
         #   block_size：上下文最大长度（一次最多看多少个字符，比如 128）
         #   dropout：随机丢弃比例（训练时随机把一些神经元置 0，防止过拟合）
         #   pos_enc：位置编码方式 "abs"=绝对位置表（GPT-2 经典）/ "rope"=旋转位置编码（现代大模型）
@@ -170,16 +176,23 @@ class CausalSelfAttention(nn.Module):
         # ↑ 断言：特征维度必须能被头数整除，因为要平均分给每个头。
         #   比如 128 维 / 4 头 = 每个头 32 维。
         self.n_head = n_head
+        self.n_kv_head = n_head if n_kv_head is None else n_kv_head
+        assert n_head % self.n_kv_head == 0, "Q 头数必须能被 K/V 头数整除（每组 K/V 服务整数个 Q 头）"
+        # ↑ 比如 4 个 Q 头 / 2 个 K/V 头 = 每组 K/V 服务 2 个 Q 头
         self.head_dim = n_embd // n_head  # 每个头分到的维度
         self.pos_enc = pos_enc
 
         # ---- 核心权重矩阵 ----
         # 一个线性层同时算出 Q、K、V（把三个矩阵拼在一起，效率更高）
-        # 输入 n_embd 维，输出 3*n_embd 维（前 1/3 是 Q，中间 1/3 是 K，后 1/3 是 V）
-        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        # 【GQA 关键】K/V 只算 n_kv_head 份！输出维度从 3*n_embd 降到 n_embd + 2*n_kv_embd
+        #   MHA：Q 4 组 + K 4 组 + V 4 组 = 输出 3×128 = 384 维
+        #   GQA：Q 4 组 + K 2 组 + V 2 组 = 输出 128 + 2×64 = 192 维（省一半）
+        n_kv_embd = self.n_kv_head * self.head_dim          # K/V 占用的总维度（如 2×32=64）
+        self.c_attn = nn.Linear(n_embd, n_embd + 2 * n_kv_embd, bias=False)
         # ↑ nn.Linear(in, out) 是一个"全连接层"，内部有一个权重矩阵 shape=[out, in]。
         #   它做的事就是：输出 = 输入 @ 权重矩阵.T（矩阵乘法）。
         #   bias=False 表示不要偏置项（只做矩阵乘法，不加常数）。
+        #   前 n_embd 列是 Q，中间 n_kv_embd 列是 K，后 n_kv_embd 列是 V
 
         # 把多头拼回来之后，再做一次线性变换，融合各头的信息
         self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
@@ -223,16 +236,17 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.shape  # 解包出三个维度的大小
 
         # ---- 第一步：算出 Q、K、V ----
-        qkv = self.c_attn(x)          # (B, T, 3C)，一次算出 QKV 拼在一起
-        q, k, v = qkv.split(C, dim=2) # 沿最后一维切成三份，各 (B, T, C)
+        qkv = self.c_attn(x)          # (B, T, n_embd + 2*n_kv_embd)，一次算出 QKV 拼在一起
+        n_kv_embd = self.n_kv_head * self.head_dim              # K/V 各占的维度（如 2×32=64）
+        q, k, v = qkv.split([C, n_kv_embd, n_kv_embd], dim=2)   # 前 C 是 Q，中间/后是 K/V
 
         # ---- 第二步：拆成多头 ----
         # 把 (B, T, C) 变成 (B, n_head, T, head_dim)
         # view 是"改变形状"（不改变数据），transpose 是"交换两个维度"
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        # 现在 q/k/v 的形状都是 (B, n_head, T, head_dim)
+        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        # 现在 q 的形状是 (B, n_head, T, head_dim)，k/v 是 (B, n_kv_head, T, head_dim)
 
         # ---- 第二步半：RoPE 旋转（pos_enc="rope" 时）----
         # 在算点积之前，把 Q 和 K 按各自位置旋转（V 不转——它只是内容，不参与"找谁相关"）。
@@ -244,6 +258,15 @@ class CausalSelfAttention(nn.Module):
                 self.cos[:, :, pos_offset:pos_offset + T, :],
                 self.sin[:, :, pos_offset:pos_offset + T, :],
             )
+
+        # ---- 第二步半·乙：GQA 把 K/V 复制成 n_head 份（分组共享）----
+        # 只有 n_kv_head 组 K/V，要服务 n_head 组 Q。做法：沿头维复制，
+        # 每组 K/V 连续服务 n_head/n_kv_head 个 Q 头（如 2 个）。
+        # repeat_interleave(dim=1) = 沿第 1 维（头维）把每个元素连续复制
+        if self.n_kv_head < self.n_head:
+            k = k.repeat_interleave(self.n_head // self.n_kv_head, dim=1)  # (B, n_head, T, head_dim)
+            v = v.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
+        # ↑ 之后 k/v 形状和 q 一样：都是 (B, n_head, T, head_dim)，后续代码零改动
 
         # ---- KV Cache：把历史 K/V 拼进来（增量生成时）----
         # 预填充阶段：cache 是空 dict，直接把本层 K/V 存进去（首次赋值）。
@@ -354,10 +377,10 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, n_embd, n_head, block_size, dropout=0.0, activation="gelu", pos_enc="abs", rope_base=10000.0):
+    def __init__(self, n_embd, n_head, block_size, dropout=0.0, activation="gelu", pos_enc="abs", rope_base=10000.0, n_kv_head=None):
         super().__init__()
         self.ln1 = LayerNorm(n_embd)       # 注意力前的归一化
-        self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout, pos_enc, rope_base)  # 注意力
+        self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout, pos_enc, rope_base, n_kv_head)  # 注意力
         self.ln2 = LayerNorm(n_embd)       # MLP 前的归一化
         self.mlp = MLP(n_embd, dropout, activation)  # 前馈网络（gelu 或 swiglu）
 
@@ -383,10 +406,11 @@ class Block(nn.Module):
 class GPT(nn.Module):
 
     def __init__(self, vocab_size, n_embd=128, n_head=4, n_layer=4,
-                 block_size=128, dropout=0.0, activation="gelu", pos_enc="abs", rope_base=10000.0):
+                 block_size=128, dropout=0.0, activation="gelu", pos_enc="abs", rope_base=10000.0, n_kv_head=None):
         # ↑ vocab_size：词表大小（有多少种不同的字符，我们的莎士比亚数据是 65）
         #   n_embd：每个字符用多少个数表示（向量维度）
         #   n_head：注意力头数
+        #   n_kv_head：K/V 头数（GQA 实验 8）。None = 和 n_head 一样（标准 MHA）
         #   n_layer：堆多少个 Transformer 层（这就是"权重的层数"）
         #   block_size：上下文最大长度
         #   activation：MLP 激活函数（"gelu" 经典版 / "swiglu" 现代大模型版）
@@ -413,7 +437,7 @@ class GPT(nn.Module):
         # ---- 堆叠 n_layer 个 Transformer 层 ----
         # ModuleList 是 PyTorch 专门放"一堆子模块"的容器，会自动注册里面的参数
         self.blocks = nn.ModuleList(
-            [Block(n_embd, n_head, block_size, dropout, activation, pos_enc, rope_base)
+            [Block(n_embd, n_head, block_size, dropout, activation, pos_enc, rope_base, n_kv_head)
              for _ in range(n_layer)]
         )
 
